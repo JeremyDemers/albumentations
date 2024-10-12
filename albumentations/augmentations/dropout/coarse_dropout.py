@@ -1,188 +1,209 @@
+from __future__ import annotations
+
 import random
-import typing
-from typing import Optional, List, Tuple, Iterable, Union
+from typing import Annotated, Any
+from warnings import warn
 
 import numpy as np
+from pydantic import AfterValidator, Field, model_validator
+from typing_extensions import Literal, Self
 
-from ...core.transforms_interface import DualTransform
-from .functional import cutout
-
+from albumentations import random_utils
+from albumentations.augmentations.dropout.transforms import BaseDropout
+from albumentations.core.pydantic import check_1plus, nondecreasing
+from albumentations.core.types import ColorType, NumericType, ScalarType
 
 __all__ = ["CoarseDropout"]
 
 
-class CoarseDropout(DualTransform):
-    """CoarseDropout of the rectangular regions in the image.
+class CoarseDropout(BaseDropout):
+    """CoarseDropout randomly drops out rectangular regions from the image and optionally,
+    the corresponding regions in an associated mask, to simulate occlusion and
+    varied object sizes found in real-world settings.
+
+    This transformation is an evolution of CutOut and RandomErasing, offering more
+    flexibility in the size, number of dropout regions, and fill values.
 
     Args:
-        max_holes (int): Maximum number of regions to zero out.
-        max_height (int, float): Maximum height of the hole.
-        If float, it is calculated as a fraction of the image height.
-        max_width (int, float): Maximum width of the hole.
-        If float, it is calculated as a fraction of the image width.
-        min_holes (int): Minimum number of regions to zero out. If `None`,
-            `min_holes` is be set to `max_holes`. Default: `None`.
-        min_height (int, float): Minimum height of the hole. Default: None. If `None`,
-            `min_height` is set to `max_height`. Default: `None`.
-            If float, it is calculated as a fraction of the image height.
-        min_width (int, float): Minimum width of the hole. If `None`, `min_height` is
-            set to `max_width`. Default: `None`.
-            If float, it is calculated as a fraction of the image width.
-
-        fill_value (int, float, list of int, list of float): value for dropped pixels.
-        mask_fill_value (int, float, list of int, list of float): fill value for dropped pixels
-            in mask. If `None` - mask is not affected. Default: `None`.
+        num_holes_range (tuple[int, int]): Range (min, max) for the number of rectangular
+            regions to drop out. Default: (1, 1)
+        hole_height_range (tuple[ScalarType, ScalarType]): Range (min, max) for the height
+            of dropout regions. If int, specifies absolute pixel values. If float,
+            interpreted as a fraction of the image height. Default: (8, 8)
+        hole_width_range (tuple[ScalarType, ScalarType]): Range (min, max) for the width
+            of dropout regions. If int, specifies absolute pixel values. If float,
+            interpreted as a fraction of the image width. Default: (8, 8)
+        fill_value (int | float | Literal["random"] | tuple[int | float,...]): Value for the dropped pixels. Can be:
+            - int or float: all channels are filled with this value.
+            - tuple: tuple of values for each channel.
+            - 'random': filled with random values.
+            Default: 0.
+        mask_fill_value (ColorType | None): Fill value for dropout regions in the mask.
+            If None, mask regions corresponding to image dropouts are unchanged. Default: None
+        p (float): Probability of applying the transform. Default: 0.5
 
     Targets:
-        image, mask, keypoints
+        image, mask, bboxes, keypoints
 
     Image types:
         uint8, float32
 
-    Reference:
-    |  https://arxiv.org/abs/1708.04552
-    |  https://github.com/uoguelph-mlrg/Cutout/blob/master/util/cutout.py
-    |  https://github.com/aleju/imgaug/blob/master/imgaug/augmenters/arithmetic.py
+    Note:
+        - The actual number and size of dropout regions are randomly chosen within the specified ranges for each
+            application.
+        - When using float values for hole_height_range and hole_width_range, ensure they are between 0 and 1.
+        - This implementation includes deprecation warnings for older parameter names (min_holes, max_holes, etc.).
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> mask = np.random.randint(0, 2, (100, 100), dtype=np.uint8)
+        >>> augmentation = A.CoarseDropout(num_holes_range=(3, 6),
+        ...                                hole_height_range=(10, 20),
+        ...                                hole_width_range=(10, 20),
+        ...                                fill_value=0,
+        ...                                p=1.0)
+        >>> transformed = augmentation(image=image, mask=mask)
+        >>> transformed_image, transformed_mask = transformed["image"], transformed["mask"]
+
+    References:
+        - CutOut: https://arxiv.org/abs/1708.04552
+        - Random Erasing: https://arxiv.org/abs/1708.04896
     """
+
+    class InitSchema(BaseDropout.InitSchema):
+        min_holes: int | None = Field(ge=0)
+        max_holes: int | None = Field(ge=0)
+        num_holes_range: Annotated[tuple[int, int], AfterValidator(check_1plus), AfterValidator(nondecreasing)]
+
+        min_height: ScalarType | None = Field(ge=0)
+        max_height: ScalarType | None = Field(ge=0)
+        hole_height_range: tuple[ScalarType, ScalarType]
+
+        min_width: ScalarType | None = Field(ge=0)
+        max_width: ScalarType | None = Field(ge=0)
+        hole_width_range: tuple[ScalarType, ScalarType]
+
+        @staticmethod
+        def update_range(
+            min_value: NumericType | None,
+            max_value: NumericType | None,
+            default_range: tuple[NumericType, NumericType],
+        ) -> tuple[NumericType, NumericType]:
+            if max_value is not None:
+                return (min_value or max_value, max_value)
+            return default_range
+
+        @staticmethod
+        def validate_range(range_value: tuple[ScalarType, ScalarType], range_name: str, minimum: float = 0) -> None:
+            if not minimum <= range_value[0] <= range_value[1]:
+                raise ValueError(
+                    f"First value in {range_name} should be less or equal than the second value "
+                    f"and at least {minimum}. Got: {range_value}",
+                )
+            if isinstance(range_value[0], float) and not all(0 <= x <= 1 for x in range_value):
+                raise ValueError(f"All values in {range_name} should be in [0, 1] range. Got: {range_value}")
+
+        @model_validator(mode="after")
+        def check_num_holes_and_dimensions(self) -> Self:
+            if self.min_holes is not None:
+                warn("`min_holes` is deprecated. Use num_holes_range instead.", DeprecationWarning, stacklevel=2)
+            if self.max_holes is not None:
+                warn("`max_holes` is deprecated. Use num_holes_range instead.", DeprecationWarning, stacklevel=2)
+            if self.min_height is not None:
+                warn("`min_height` is deprecated. Use hole_height_range instead.", DeprecationWarning, stacklevel=2)
+            if self.max_height is not None:
+                warn("`max_height` is deprecated. Use hole_height_range instead.", DeprecationWarning, stacklevel=2)
+            if self.min_width is not None:
+                warn("`min_width` is deprecated. Use hole_width_range instead.", DeprecationWarning, stacklevel=2)
+            if self.max_width is not None:
+                warn("`max_width` is deprecated. Use hole_width_range instead.", DeprecationWarning, stacklevel=2)
+
+            if self.max_holes is not None:
+                self.num_holes_range = self.update_range(self.min_holes, self.max_holes, self.num_holes_range)
+
+            self.validate_range(self.num_holes_range, "num_holes_range", minimum=1)
+
+            if self.max_height is not None:
+                self.hole_height_range = self.update_range(self.min_height, self.max_height, self.hole_height_range)
+            self.validate_range(self.hole_height_range, "hole_height_range")
+
+            if self.max_width is not None:
+                self.hole_width_range = self.update_range(self.min_width, self.max_width, self.hole_width_range)
+            self.validate_range(self.hole_width_range, "hole_width_range")
+
+            return self
 
     def __init__(
         self,
-        max_holes: int = 8,
-        max_height: int = 8,
-        max_width: int = 8,
-        min_holes: Optional[int] = None,
-        min_height: Optional[int] = None,
-        min_width: Optional[int] = None,
-        fill_value: int = 0,
-        mask_fill_value: Optional[int] = None,
-        always_apply: bool = False,
+        max_holes: int | None = None,
+        max_height: ScalarType | None = None,
+        max_width: ScalarType | None = None,
+        min_holes: int | None = None,
+        min_height: ScalarType | None = None,
+        min_width: ScalarType | None = None,
+        fill_value: ColorType | Literal["random"] = 0,
+        mask_fill_value: ColorType | None = None,
+        num_holes_range: tuple[int, int] = (1, 1),
+        hole_height_range: tuple[ScalarType, ScalarType] = (8, 8),
+        hole_width_range: tuple[ScalarType, ScalarType] = (8, 8),
+        always_apply: bool | None = None,
         p: float = 0.5,
     ):
-        super(CoarseDropout, self).__init__(always_apply, p)
-        self.max_holes = max_holes
-        self.max_height = max_height
-        self.max_width = max_width
-        self.min_holes = min_holes if min_holes is not None else max_holes
-        self.min_height = min_height if min_height is not None else max_height
-        self.min_width = min_width if min_width is not None else max_width
-        self.fill_value = fill_value
-        self.mask_fill_value = mask_fill_value
-        if not 0 < self.min_holes <= self.max_holes:
-            raise ValueError("Invalid combination of min_holes and max_holes. Got: {}".format([min_holes, max_holes]))
+        super().__init__(fill_value=fill_value, mask_fill_value=mask_fill_value, p=p, always_apply=always_apply)
+        self.num_holes_range = num_holes_range
+        self.hole_height_range = hole_height_range
+        self.hole_width_range = hole_width_range
 
-        self.check_range(self.max_height)
-        self.check_range(self.min_height)
-        self.check_range(self.max_width)
-        self.check_range(self.min_width)
+    @staticmethod
+    def calculate_hole_dimensions(
+        image_shape: tuple[int, int],
+        height_range: tuple[ScalarType, ScalarType],
+        width_range: tuple[ScalarType, ScalarType],
+        size: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Calculate random hole dimensions based on the provided ranges."""
+        height, width = image_shape[:2]
 
-        if not 0 < self.min_height <= self.max_height:
-            raise ValueError(
-                "Invalid combination of min_height and max_height. Got: {}".format([min_height, max_height])
-            )
-        if not 0 < self.min_width <= self.max_width:
-            raise ValueError("Invalid combination of min_width and max_width. Got: {}".format([min_width, max_width]))
+        if isinstance(height_range[0], int):
+            min_height = height_range[0]
+            max_height = min(height_range[1], height)
 
-    def check_range(self, dimension):
-        if isinstance(dimension, float) and not 0 <= dimension < 1.0:
-            raise ValueError(
-                "Invalid value {}. If using floats, the value should be in the range [0.0, 1.0)".format(dimension)
-            )
+            min_width = width_range[0]
+            max_width = min(width_range[1], width)
 
-    def apply(
-        self,
-        img: np.ndarray,
-        fill_value: Union[int, float] = 0,
-        holes: Iterable[Tuple[int, int, int, int]] = (),
-        **params
-    ) -> np.ndarray:
-        return cutout(img, holes, fill_value)
+            hole_heights = random_utils.randint(int(min_height), int(max_height + 1), size=size)
+            hole_widths = random_utils.randint(int(min_width), int(max_width + 1), size=size)
 
-    def apply_to_mask(
-        self,
-        img: np.ndarray,
-        mask_fill_value: Union[int, float] = 0,
-        holes: Iterable[Tuple[int, int, int, int]] = (),
-        **params
-    ) -> np.ndarray:
-        if mask_fill_value is None:
-            return img
-        return cutout(img, holes, mask_fill_value)
+        else:  # Assume float
+            hole_heights = (height * random_utils.uniform(height_range[0], height_range[1], size=size)).astype(int)
+            hole_widths = (width * random_utils.uniform(width_range[0], width_range[1], size=size)).astype(int)
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
+        return hole_heights, hole_widths
 
-        holes = []
-        for _n in range(random.randint(self.min_holes, self.max_holes)):
-            if all(
-                [
-                    isinstance(self.min_height, int),
-                    isinstance(self.min_width, int),
-                    isinstance(self.max_height, int),
-                    isinstance(self.max_width, int),
-                ]
-            ):
-                hole_height = random.randint(self.min_height, self.max_height)
-                hole_width = random.randint(self.min_width, self.max_width)
-            elif all(
-                [
-                    isinstance(self.min_height, float),
-                    isinstance(self.min_width, float),
-                    isinstance(self.max_height, float),
-                    isinstance(self.max_width, float),
-                ]
-            ):
-                hole_height = int(height * random.uniform(self.min_height, self.max_height))
-                hole_width = int(width * random.uniform(self.min_width, self.max_width))
-            else:
-                raise ValueError(
-                    "Min width, max width, \
-                    min height and max height \
-                    should all either be ints or floats. \
-                    Got: {} respectively".format(
-                        [
-                            type(self.min_width),
-                            type(self.max_width),
-                            type(self.min_height),
-                            type(self.max_height),
-                        ]
-                    )
-                )
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        image_shape = params["shape"][:2]
 
-            y1 = random.randint(0, height - hole_height)
-            x1 = random.randint(0, width - hole_width)
-            y2 = y1 + hole_height
-            x2 = x1 + hole_width
-            holes.append((x1, y1, x2, y2))
+        num_holes = random.randint(*self.num_holes_range)
+
+        hole_heights, hole_widths = self.calculate_hole_dimensions(
+            image_shape,
+            self.hole_height_range,
+            self.hole_width_range,
+            size=num_holes,
+        )
+
+        height, width = image_shape[:2]
+
+        y_min = random_utils.randint(0, height - hole_heights + 1, size=num_holes)
+        x_min = random_utils.randint(0, width - hole_widths + 1, size=num_holes)
+        y_max = y_min + hole_heights
+        x_max = x_min + hole_widths
+
+        holes = np.stack([x_min, y_min, x_max, y_max], axis=-1)
 
         return {"holes": holes}
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def _keypoint_in_hole(self, keypoint: Tuple[float, ...], hole: Tuple[int, int, int, int]) -> bool:
-        x1, y1, x2, y2 = hole
-        x, y = keypoint[:2]
-        return x1 <= x < x2 and y1 <= y < y2
-
-    def apply_to_keypoints(self, keypoints: List[Tuple[float, ...]], holes: Iterable[Tuple] = (), **params):
-        for hole in holes:
-            remaining_keypoints = []
-            for kp in keypoints:
-                if not self._keypoint_in_hole(kp, typing.cast(Tuple[int, int, int, int], hole)):
-                    remaining_keypoints.append(kp)
-            keypoints = remaining_keypoints
-        return keypoints
-
-    def get_transform_init_args_names(self):
-        return (
-            "max_holes",
-            "max_height",
-            "max_width",
-            "min_holes",
-            "min_height",
-            "min_width",
-            "fill_value",
-            "mask_fill_value",
-        )
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return (*super().get_transform_init_args_names(), "num_holes_range", "hole_height_range", "hole_width_range")

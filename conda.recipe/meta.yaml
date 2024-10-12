@@ -9,23 +9,26 @@ source:
 
 build:
   number: 0
-  script: python setup.py install --single-version-externally-managed --record=record.txt
+  script: python -m pip install . --no-deps --ignore-installed --no-cache-dir -vvv
 
-# https://conda.io/docs/user-guide/tasks/build-packages/define-metadata.html#export-runtime-requirements
 requirements:
   build:
     - python
-    - numpy>=1.11.1,<1.16.0
+    - numpy>=1.24.4
     - scipy
-    - opencv
+    - pydantic>=2.7
+    - pytorch
+    - typing_extensions
+    - opencv-python-headless  # Ensure correct dependency
 
   run:
     - python
-    - numpy>=1.11.1,<1.16.0
+    - numpy>=1.24.4
     - scipy
-    - opencv
-    # ImgAug is not at Conda and should be installed via pip install 'imgaug>=0.2.5,<0.2.7'
-    # - imgaug>=0.2.5,<0.2.7
+    - pydantic>=2.7
+    - pytorch
+    - typing_extensions
+    - opencv-python-headless  # Ensure correct dependency
 
 test:
   imports:
@@ -34,4 +37,4 @@ test:
 about:
   home: {{ data['url'] }}
   license: {{ data['license'] }}
-summary: {{ data['description'] }}
+  summary: {{ data['description'] }}

@@ -158,3 +158,11 @@ fabric.properties
 .idea
 
 conda_build/
+
+.vscode/
+
+*.ipynb
+
+.ruff_cache/
+
+data/

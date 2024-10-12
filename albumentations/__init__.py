@@ -1,15 +1,13 @@
-from __future__ import absolute_import
+import os
 
-__version__ = "1.1.0"
+from albumentations.check_version import check_for_updates
 
+from ._version import __version__  # noqa: F401
 from .augmentations import *
 from .core.composition import *
 from .core.serialization import *
 from .core.transforms_interface import *
 
-try:
-    from .imgaug.transforms import *  # type: ignore
-except ImportError:
-    # imgaug is not installed by default, so we import stubs.
-    # Run `pip install -U albumentations[imgaug] if you need augmentations from imgaug.`
-    from .imgaug.stubs import *  # type: ignore
+# Perform the version check after all other initializations
+if os.getenv("NO_ALBUMENTATIONS_UPDATE", "").lower() not in {"true", "1"}:
+    check_for_updates()

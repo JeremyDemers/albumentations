@@ -1,154 +1,174 @@
-import random
-from typing import Tuple, Iterable
+from __future__ import annotations
 
-import numpy as np
+from typing import Annotated, Any, Literal
+from warnings import warn
 
-from . import functional as F
-from ...core.transforms_interface import DualTransform
+from pydantic import AfterValidator, Field, model_validator
+from typing_extensions import Self
+
+import albumentations.augmentations.dropout.functional as fdropout
+from albumentations import random_utils
+from albumentations.augmentations.dropout.transforms import BaseDropout
+from albumentations.core.pydantic import check_0plus, check_1plus, nondecreasing
+from albumentations.core.types import MIN_UNIT_SIZE, ColorType
 
 __all__ = ["GridDropout"]
 
 
-class GridDropout(DualTransform):
-    """GridDropout, drops out rectangular regions of an image and the corresponding mask in a grid fashion.
+class GridDropout(BaseDropout):
+    """Apply GridDropout augmentation to images, masks, bounding boxes, and keypoints.
+
+    GridDropout drops out rectangular regions of an image and the corresponding mask in a grid fashion.
+    This technique can help improve model robustness by forcing the network to rely on a broader context
+    rather than specific local features.
 
     Args:
-        ratio (float): the ratio of the mask holes to the unit_size (same for horizontal and vertical directions).
+        ratio (float): The ratio of the mask holes to the unit size (same for horizontal and vertical directions).
             Must be between 0 and 1. Default: 0.5.
-        unit_size_min (int): minimum size of the grid unit. Must be between 2 and the image shorter edge.
-            If 'None', holes_number_x and holes_number_y are used to setup the grid. Default: `None`.
-        unit_size_max (int): maximum size of the grid unit. Must be between 2 and the image shorter edge.
-            If 'None', holes_number_x and holes_number_y are used to setup the grid. Default: `None`.
-        holes_number_x (int): the number of grid units in x direction. Must be between 1 and image width//2.
-            If 'None', grid unit width is set as image_width//10. Default: `None`.
-        holes_number_y (int): the number of grid units in y direction. Must be between 1 and image height//2.
-            If `None`, grid unit height is set equal to the grid unit width or image height, whatever is smaller.
-        shift_x (int): offsets of the grid start in x direction from (0,0) coordinate.
-            Clipped between 0 and grid unit_width - hole_width. Default: 0.
-        shift_y (int): offsets of the grid start in y direction from (0,0) coordinate.
-            Clipped between 0 and grid unit height - hole_height. Default: 0.
-        random_offset (boolean): weather to offset the grid randomly between 0 and grid unit size - hole size
-            If 'True', entered shift_x, shift_y are ignored and set randomly. Default: `False`.
-        fill_value (int): value for the dropped pixels. Default = 0
-        mask_fill_value (int): value for the dropped pixels in mask.
-            If `None`, transformation is not applied to the mask. Default: `None`.
+        unit_size_range (tuple[int, int] | None): Range from which to sample grid size. Default: None.
+            Must be between 2 and the image's shorter edge. If None, grid size is calculated based on image size.
+        holes_number_xy (tuple[int, int] | None): The number of grid units in x and y directions.
+            First value should be between 1 and image width//2,
+            Second value should be between 1 and image height//2.
+            Default: None. If provided, overrides unit_size_range.
+        random_offset (bool): Whether to offset the grid randomly between 0 and (grid unit size - hole size).
+            If True, entered shift_xy is ignored and set randomly. Default: True.
+        fill_value (int | float | Literal["random"] | tuple[int | float,...]): Value for the dropped pixels. Can be:
+            - int or float: all channels are filled with this value.
+            - tuple: tuple of values for each channel.
+            - 'random': filled with random values.
+            Default: 0.
+        mask_fill_value (int | float | tuple[int | float,...] | None): Value for the dropped pixels in mask.
+            If None, the mask is not modified. Default: None.
+        shift_xy (tuple[int, int]): Offsets of the grid start in x and y directions from (0,0) coordinate.
+            Only used when random_offset is False. Default: (0, 0).
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
-        image, mask
+        image, mask, bboxes, keypoints
 
     Image types:
         uint8, float32
 
-    References:
-        https://arxiv.org/abs/2001.04086
+    Note:
+        - If both unit_size_range and holes_number_xy are None, the grid size is calculated based on the image size.
+        - The actual number of dropped regions may differ slightly from holes_number_xy due to rounding.
+        - This implementation includes deprecation warnings for older parameter names.
 
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> mask = np.random.randint(0, 2, (100, 100), dtype=np.uint8)
+        >>> augmentation = A.GridDropout(ratio=0.3, unit_size_range=(10, 20), random_offset=True, p=1.0)
+        >>> transformed = augmentation(image=image, mask=mask)
+        >>> transformed_image, transformed_mask = transformed["image"], transformed["mask"]
+
+    Reference:
+        - Paper: https://arxiv.org/abs/2001.04086
     """
+
+    class InitSchema(BaseDropout.InitSchema):
+        ratio: float = Field(gt=0, le=1)
+
+        unit_size_min: int | None = Field(ge=2)
+        unit_size_max: int | None = Field(ge=2)
+
+        holes_number_x: int | None = Field(ge=1)
+        holes_number_y: int | None = Field(ge=1)
+
+        shift_x: int | None = Field(ge=0)
+        shift_y: int | None = Field(ge=0)
+
+        random_offset: bool
+        fill_value: ColorType | Literal["random"]
+        mask_fill_value: ColorType | None
+        unit_size_range: Annotated[tuple[int, int], AfterValidator(check_1plus), AfterValidator(nondecreasing)] | None
+        shift_xy: Annotated[tuple[int, int], AfterValidator(check_0plus)]
+
+        holes_number_xy: Annotated[tuple[int, int], AfterValidator(check_1plus)] | None
+
+        @model_validator(mode="after")
+        def validate_normalization(self) -> Self:
+            if self.unit_size_min is not None and self.unit_size_max is not None:
+                self.unit_size_range = self.unit_size_min, self.unit_size_max
+                warn(
+                    "unit_size_min and unit_size_max are deprecated. Use unit_size_range instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+            if self.shift_x is not None and self.shift_y is not None:
+                self.shift_xy = self.shift_x, self.shift_y
+                warn("shift_x and shift_y are deprecated. Use shift_xy instead.", DeprecationWarning, stacklevel=2)
+
+            if self.holes_number_x is not None and self.holes_number_y is not None:
+                self.holes_number_xy = self.holes_number_x, self.holes_number_y
+                warn(
+                    "holes_number_x and holes_number_y are deprecated. Use holes_number_xy instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+            if self.unit_size_range and not MIN_UNIT_SIZE <= self.unit_size_range[0] <= self.unit_size_range[1]:
+                raise ValueError("Max unit size should be >= min size, both at least 2 pixels.")
+
+            return self
 
     def __init__(
         self,
         ratio: float = 0.5,
-        unit_size_min: int = None,
-        unit_size_max: int = None,
-        holes_number_x: int = None,
-        holes_number_y: int = None,
-        shift_x: int = 0,
-        shift_y: int = 0,
-        random_offset: bool = False,
-        fill_value: int = 0,
-        mask_fill_value: int = None,
-        always_apply: bool = False,
+        unit_size_min: int | None = None,
+        unit_size_max: int | None = None,
+        holes_number_x: int | None = None,
+        holes_number_y: int | None = None,
+        shift_x: int | None = None,
+        shift_y: int | None = None,
+        random_offset: bool = True,
+        fill_value: ColorType | Literal["random"] = 0,
+        mask_fill_value: ColorType | None = None,
+        unit_size_range: tuple[int, int] | None = None,
+        holes_number_xy: tuple[int, int] | None = None,
+        shift_xy: tuple[int, int] = (0, 0),
+        always_apply: bool | None = None,
         p: float = 0.5,
     ):
-        super(GridDropout, self).__init__(always_apply, p)
+        super().__init__(fill_value=fill_value, mask_fill_value=mask_fill_value, p=p, always_apply=always_apply)
         self.ratio = ratio
-        self.unit_size_min = unit_size_min
-        self.unit_size_max = unit_size_max
-        self.holes_number_x = holes_number_x
-        self.holes_number_y = holes_number_y
-        self.shift_x = shift_x
-        self.shift_y = shift_y
+        self.unit_size_range = unit_size_range
+        self.holes_number_xy = holes_number_xy
         self.random_offset = random_offset
-        self.fill_value = fill_value
-        self.mask_fill_value = mask_fill_value
-        if not 0 < self.ratio <= 1:
-            raise ValueError("ratio must be between 0 and 1.")
+        self.shift_xy = shift_xy
 
-    def apply(self, img: np.ndarray, holes: Iterable[Tuple[int, int, int, int]] = (), **params) -> np.ndarray:
-        return F.cutout(img, holes, self.fill_value)
-
-    def apply_to_mask(self, img: np.ndarray, holes: Iterable[Tuple[int, int, int, int]] = (), **params) -> np.ndarray:
-        if self.mask_fill_value is None:
-            return img
-
-        return F.cutout(img, holes, self.mask_fill_value)
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
-        # set grid using unit size limits
-        if self.unit_size_min and self.unit_size_max:
-            if not 2 <= self.unit_size_min <= self.unit_size_max:
-                raise ValueError("Max unit size should be >= min size, both at least 2 pixels.")
-            if self.unit_size_max > min(height, width):
-                raise ValueError("Grid size limits must be within the shortest image edge.")
-            unit_width = random.randint(self.unit_size_min, self.unit_size_max + 1)
-            unit_height = unit_width
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        image_shape = params["shape"]
+        if self.holes_number_xy:
+            grid = self.holes_number_xy
         else:
-            # set grid using holes numbers
-            if self.holes_number_x is None:
-                unit_width = max(2, width // 10)
-            else:
-                if not 1 <= self.holes_number_x <= width // 2:
-                    raise ValueError("The hole_number_x must be between 1 and image width//2.")
-                unit_width = width // self.holes_number_x
-            if self.holes_number_y is None:
-                unit_height = max(min(unit_width, height), 2)
-            else:
-                if not 1 <= self.holes_number_y <= height // 2:
-                    raise ValueError("The hole_number_y must be between 1 and image height//2.")
-                unit_height = height // self.holes_number_y
+            # Calculate grid based on unit_size_range or default
+            unit_height, unit_width = fdropout.calculate_grid_dimensions(
+                image_shape,
+                self.unit_size_range,
+                self.holes_number_xy,
+            )
+            grid = (image_shape[0] // unit_height, image_shape[1] // unit_width)
 
-        hole_width = int(unit_width * self.ratio)
-        hole_height = int(unit_height * self.ratio)
-        # min 1 pixel and max unit length - 1
-        hole_width = min(max(hole_width, 1), unit_width - 1)
-        hole_height = min(max(hole_height, 1), unit_height - 1)
-        # set offset of the grid
-        if self.shift_x is None:
-            shift_x = 0
-        else:
-            shift_x = min(max(0, self.shift_x), unit_width - hole_width)
-        if self.shift_y is None:
-            shift_y = 0
-        else:
-            shift_y = min(max(0, self.shift_y), unit_height - hole_height)
-        if self.random_offset:
-            shift_x = random.randint(0, unit_width - hole_width)
-            shift_y = random.randint(0, unit_height - hole_height)
-        holes = []
-        for i in range(width // unit_width + 1):
-            for j in range(height // unit_height + 1):
-                x1 = min(shift_x + unit_width * i, width)
-                y1 = min(shift_y + unit_height * j, height)
-                x2 = min(x1 + hole_width, width)
-                y2 = min(y1 + hole_height, height)
-                holes.append((x1, y1, x2, y2))
-
+        holes = fdropout.generate_grid_holes(
+            image_shape,
+            grid,
+            self.ratio,
+            self.random_offset,
+            random_utils.get_random_state(),
+            self.shift_xy,
+        )
         return {"holes": holes}
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
         return (
+            *super().get_transform_init_args_names(),
             "ratio",
-            "unit_size_min",
-            "unit_size_max",
-            "holes_number_x",
-            "holes_number_y",
-            "shift_x",
-            "shift_y",
-            "mask_fill_value",
+            "unit_size_range",
+            "holes_number_xy",
+            "shift_xy",
             "random_offset",
         )
